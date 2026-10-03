@@ -71,6 +71,12 @@ function sendJson(res, status, obj) {
   res.end(body)
 }
 
+/** True if a stream event still has something to forward once over-cap tool calls are removed. */
+function hasPayload(d) {
+  return (d.choices || []).some((c) => c.delta && Object.entries(c.delta).some(([k, v]) =>
+    k === 'tool_calls' ? v.length > 0 : k !== 'role' && v !== null && v !== undefined && v !== ''))
+}
+
 /**
  * Keep the newest `max` image parts across all messages; replace the older
  * ones, in place, with a text note. Newest-first because the latest image is
@@ -203,14 +209,23 @@ function forward(req, res, target, body, route = {}) {
       try {
         for await (const frame of sseEvents(ur)) {
           if (res.destroyed) return
+          let d = null; const over = new Set()
           if (frame.data && frame.data !== '[DONE]') {
-            const d = JSON.parse(frame.data)
+            d = JSON.parse(frame.data)
             lastId = d.id || lastId
-            for (const c of d.choices || []) for (const tc of (c.delta && c.delta.tool_calls) || []) seen.add(tc.index)
+            for (const c of d.choices || []) {
+              const calls = (c.delta && c.delta.tool_calls) || []
+              const kept = calls.filter((tc) => {
+                if (seen.has(tc.index) || seen.size < toolCap) { seen.add(tc.index); return true }
+                over.add(tc.index); return false
+              })
+              if (kept.length < calls.length) { c.delta.tool_calls = kept; c.finish_reason = null }
+            }
           }
           startResponse()
-          if (seen.size > toolCap) {
-            log(`${route.upstream}: tool-call storm guard tripped at ${seen.size} calls; cutting the response`)
+          if (over.size) {
+            log(`${route.upstream}: tool-call storm guard tripped at ${seen.size + over.size} calls; cutting the response`)
+            if (hasPayload(d) && !await writeSse(res, 'data: ' + JSON.stringify(d) + '\n\n')) return
             const fin = { id: lastId || 'guard', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'mimo-v2.6-flash', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }
             await writeSse(res, 'data: ' + JSON.stringify(fin) + '\n\ndata: [DONE]\n\n')
             res.end(); up.destroy()
